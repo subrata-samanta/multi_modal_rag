@@ -91,3 +91,4 @@ c:\Users\Subrata Samanta\Desktop\multi Modal rag\
 - **Content Type Separation**: Stores text, tables, and visuals separately for better organization
 - **Context Formatting**: Structures retrieved content for optimal LLM processing
 - **Source Tracking**: Maintains metadata for proper citation and traceability
+"# multi_modal_rag" 
