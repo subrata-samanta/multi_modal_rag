@@ -1,0 +1,33 @@
+# Google service account key
+key.json
+
+*.json
+
+# Environment files
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Database and storage
+extraction_logs/
+chroma_db/
+stored_images/
+*.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

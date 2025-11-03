@@ -1,0 +1,15 @@
+langchain
+langchain-core
+langchain-google-vertexai
+langchain-chroma
+langchain-text-splitters
+google-generativeai
+google-auth
+google-cloud-aiplatform
+chromadb
+PyMuPDF
+python-pptx
+pillow
+pydantic
+python-dotenv
+tqdm
