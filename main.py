@@ -95,14 +95,14 @@ def ingest_mode(rag):
     choice = input("\nEnter your choice (1-3): ").strip()
     
     if choice == "1":
-        file_path = input("Enter the path to your PDF or PPTX file: ").strip()
+        file_path = input("Enter the path to your document file (PDF, PPTX, EML, XLS, XLSX): ").strip()
         
         if not os.path.exists(file_path):
             print("File not found. Please check the path.")
             return
         
-        if not file_path.lower().endswith(('.pdf', '.pptx')):
-            print("Unsupported file type. Please use PDF or PPTX files.")
+        if not file_path.lower().endswith(('.pdf', '.pptx', '.eml', '.xls', '.xlsx')):
+            print("Unsupported file type. Please use PDF, PPTX, EML, XLS, or XLSX files.")
             return
         
         # Ask for parallel processing
@@ -171,7 +171,7 @@ def ingest_mode(rag):
             print(f"✗ Error log saved to: {log_path}")
     
     elif choice == "2":
-        folder_path = input("Enter the path to the folder containing PDF/PPTX files: ").strip()
+        folder_path = input("Enter the path to the folder containing document files (PDF, PPTX, EML, XLS, XLSX): ").strip()
         
         if not os.path.exists(folder_path):
             print("Folder not found. Please check the path.")
@@ -186,12 +186,12 @@ def ingest_mode(rag):
         use_parallel = use_parallel != 'n'
         
         try:
-            # Get all PDF and PPTX files in the folder
+            # Get all supported files in the folder
             files = [f for f in os.listdir(folder_path) 
-                    if f.lower().endswith(('.pdf', '.pptx'))]
+                    if f.lower().endswith(('.pdf', '.pptx', '.eml', '.xls', '.xlsx'))]
             
             if not files:
-                print("No PDF or PPTX files found in the folder.")
+                print("No supported files found in the folder. Supported formats: PDF, PPTX, EML, XLS, XLSX.")
                 return
             
             print(f"\nFound {len(files)} file(s) to process:")
@@ -340,7 +340,7 @@ def main():
     rag = MultiModalRAGPipeline()
     
     print("=== Multimodal RAG Pipeline ===")
-    print("This pipeline can process PDF and PPTX files using Google Gemini Vision")
+    print("This pipeline can process PDF, PPTX, EML, XLS, and XLSX files using Google Gemini Vision")
     print("It extracts text, tables, and visual information for comprehensive Q&A")
     print()
     

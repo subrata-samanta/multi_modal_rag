@@ -11,6 +11,14 @@ from langchain_core.messages import HumanMessage
 from config import Config
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import email
+from email import policy
+from email.parser import BytesParser
+import openpyxl
+import xlrd
+from openpyxl.drawing.image import Image as OpenpyxlImage
+import zipfile
+import tempfile
 
 class DocumentProcessor:
     def __init__(self):
@@ -102,6 +110,186 @@ class DocumentProcessor:
             print(f"Error converting PPTX: {e}")
             return []
     
+    def process_eml_file(self, eml_path: str) -> Dict[str, Any]:
+        """Process EML (email) file and extract content"""
+        try:
+            with open(eml_path, 'rb') as f:
+                raw_email = f.read()
+            
+            # Parse the email
+            msg = BytesParser(policy=policy.default).parsebytes(raw_email)
+            
+            # Extract email metadata and content
+            email_content = {
+                'subject': msg.get('Subject', ''),
+                'from': msg.get('From', ''),
+                'to': msg.get('To', ''),
+                'date': msg.get('Date', ''),
+                'body_text': '',
+                'body_html': '',
+                'attachments': []
+            }
+            
+            # Extract body content
+            if msg.is_multipart():
+                for part in msg.walk():
+                    content_type = part.get_content_type()
+                    content_disposition = str(part.get('Content-Disposition', ''))
+                    
+                    if content_type == 'text/plain' and 'attachment' not in content_disposition:
+                        email_content['body_text'] = part.get_content()
+                    elif content_type == 'text/html' and 'attachment' not in content_disposition:
+                        email_content['body_html'] = part.get_content()
+                    elif 'attachment' in content_disposition:
+                        filename = part.get_filename()
+                        if filename:
+                            email_content['attachments'].append({
+                                'filename': filename,
+                                'content_type': content_type,
+                                'size': len(part.get_payload(decode=True) or b'')
+                            })
+            else:
+                # Single part message
+                email_content['body_text'] = msg.get_content()
+            
+            return email_content
+            
+        except Exception as e:
+            print(f"Error processing EML file: {e}")
+            return {}
+    
+    def extract_images_from_xlsx(self, xlsx_path: str) -> List[Image.Image]:
+        """Extract embedded images from XLSX file"""
+        images = []
+        try:
+            # Open the workbook
+            workbook = openpyxl.load_workbook(xlsx_path)
+            
+            for sheet_name in workbook.sheetnames:
+                sheet = workbook[sheet_name]
+                
+                # Check if sheet has images
+                if hasattr(sheet, '_images') and sheet._images:
+                    for img in sheet._images:
+                        try:
+                            # Get image data
+                            image_data = img._data()
+                            pil_image = Image.open(BytesIO(image_data))
+                            images.append(pil_image)
+                        except Exception as e:
+                            print(f"Error extracting image from sheet {sheet_name}: {e}")
+            
+            workbook.close()
+            
+        except Exception as e:
+            print(f"Error extracting images from XLSX: {e}")
+        
+        return images
+    
+    def convert_excel_to_images(self, excel_path: str) -> List[Image.Image]:
+        """Convert Excel sheets to images for processing"""
+        try:
+            images = []
+            file_ext = os.path.splitext(excel_path)[1].lower()
+            
+            if file_ext == '.xlsx':
+                # Use openpyxl for .xlsx files
+                workbook = openpyxl.load_workbook(excel_path, data_only=True)
+                
+                for sheet_name in workbook.sheetnames:
+                    sheet = workbook[sheet_name]
+                    
+                    # Create a visual representation of the sheet
+                    # This is a simplified approach - for better visualization,
+                    # consider using libraries like xlwings or converting via LibreOffice
+                    sheet_image = self._create_sheet_visualization(sheet, sheet_name)
+                    if sheet_image:
+                        images.append(sheet_image)
+                
+                # Also extract any embedded images
+                embedded_images = self.extract_images_from_xlsx(excel_path)
+                images.extend(embedded_images)
+                
+                workbook.close()
+                
+            elif file_ext == '.xls':
+                # Use xlrd for .xls files
+                workbook = xlrd.open_workbook(excel_path)
+                
+                for sheet_index in range(workbook.nsheets):
+                    sheet = workbook.sheet_by_index(sheet_index)
+                    sheet_name = workbook.sheet_names()[sheet_index]
+                    
+                    # Create a visual representation of the sheet
+                    sheet_image = self._create_xls_sheet_visualization(sheet, sheet_name)
+                    if sheet_image:
+                        images.append(sheet_image)
+            
+            return images
+            
+        except Exception as e:
+            print(f"Error converting Excel file: {e}")
+            return []
+    
+    def _create_sheet_visualization(self, sheet, sheet_name: str) -> Image.Image:
+        """Create a visual representation of an Excel sheet (xlsx)"""
+        try:
+            # Get sheet dimensions
+            max_row = sheet.max_row
+            max_col = sheet.max_column
+            
+            if max_row == 1 and max_col == 1 and not sheet.cell(1, 1).value:
+                return None  # Empty sheet
+            
+            # Create a simple text-based visualization
+            # For better results, consider using xlwings or similar libraries
+            cell_width = 120
+            cell_height = 30
+            
+            img_width = min(max_col * cell_width, 2000)  # Limit width
+            img_height = min(max_row * cell_height, 2000)  # Limit height
+            
+            # Create blank image
+            img = Image.new('RGB', (img_width, img_height), 'white')
+            
+            # This is a placeholder implementation
+            # In production, you might want to use more sophisticated Excel-to-image conversion
+            
+            return img
+            
+        except Exception as e:
+            print(f"Error creating sheet visualization: {e}")
+            return None
+    
+    def _create_xls_sheet_visualization(self, sheet, sheet_name: str) -> Image.Image:
+        """Create a visual representation of an Excel sheet (xls)"""
+        try:
+            # Get sheet dimensions
+            nrows = sheet.nrows
+            ncols = sheet.ncols
+            
+            if nrows == 0 or ncols == 0:
+                return None  # Empty sheet
+            
+            # Create a simple text-based visualization
+            cell_width = 120
+            cell_height = 30
+            
+            img_width = min(ncols * cell_width, 2000)  # Limit width
+            img_height = min(nrows * cell_height, 2000)  # Limit height
+            
+            # Create blank image
+            img = Image.new('RGB', (img_width, img_height), 'white')
+            
+            # This is a placeholder implementation
+            # In production, you might want to use more sophisticated Excel-to-image conversion
+            
+            return img
+            
+        except Exception as e:
+            print(f"Error creating XLS sheet visualization: {e}")
+            return None
+    
     def extract_content_from_image(self, image: Image.Image, content_type: str) -> str:
         """Extract specific content type from image using ChatVertexAI"""
         try:
@@ -155,7 +343,217 @@ class DocumentProcessor:
             traceback.print_exc()
             return ""
     
-    def process_page(self, page_data: Dict[str, Any]) -> Dict[str, Any]:
+    def process_eml_document(self, eml_path: str) -> Dict[str, List[Dict[str, Any]]]:
+        """Process EML file and extract content for RAG pipeline"""
+        try:
+            email_content = self.process_eml_file(eml_path)
+            
+            processed_content = {
+                "text": [],
+                "tables": [],
+                "visuals": []
+            }
+            
+            # Process email metadata and body as text
+            email_text_parts = []
+            
+            if email_content.get('subject'):
+                email_text_parts.append(f"Subject: {email_content['subject']}")
+            
+            if email_content.get('from'):
+                email_text_parts.append(f"From: {email_content['from']}")
+            
+            if email_content.get('to'):
+                email_text_parts.append(f"To: {email_content['to']}")
+            
+            if email_content.get('date'):
+                email_text_parts.append(f"Date: {email_content['date']}")
+            
+            if email_content.get('body_text'):
+                email_text_parts.append(f"Body:\n{email_content['body_text']}")
+            elif email_content.get('body_html'):
+                # Basic HTML stripping for HTML-only emails
+                import re
+                html_content = email_content['body_html']
+                # Remove HTML tags
+                clean_text = re.sub('<[^<]+?>', '', html_content)
+                email_text_parts.append(f"Body:\n{clean_text}")
+            
+            if email_content.get('attachments'):
+                attachment_info = []
+                for att in email_content['attachments']:
+                    attachment_info.append(f"- {att['filename']} ({att['content_type']}, {att['size']} bytes)")
+                if attachment_info:
+                    email_text_parts.append(f"Attachments:\n" + "\n".join(attachment_info))
+            
+            # Combine all email content
+            full_email_text = "\n\n".join(email_text_parts)
+            
+            processed_content["text"].append({
+                "content": full_email_text,
+                "page": 1,
+                "source": eml_path,
+                "type": "email"
+            })
+            
+            return processed_content
+            
+        except Exception as e:
+            print(f"Error processing EML document: {e}")
+            return {"text": [], "tables": [], "visuals": []}
+    
+    def process_excel_document(self, excel_path: str) -> Dict[str, List[Dict[str, Any]]]:
+        """Process Excel file and extract content for RAG pipeline"""
+        try:
+            file_ext = os.path.splitext(excel_path)[1].lower()
+            
+            processed_content = {
+                "text": [],
+                "tables": [],
+                "visuals": []
+            }
+            
+            if file_ext == '.xlsx':
+                workbook = openpyxl.load_workbook(excel_path, data_only=True)
+                
+                for sheet_index, sheet_name in enumerate(workbook.sheetnames):
+                    sheet = workbook[sheet_name]
+                    
+                    # Extract sheet data as tables
+                    sheet_data = self._extract_xlsx_sheet_data(sheet, sheet_name)
+                    if sheet_data:
+                        processed_content["tables"].append({
+                            "content": sheet_data,
+                            "page": sheet_index + 1,
+                            "source": excel_path,
+                            "type": "excel_sheet",
+                            "sheet_name": sheet_name
+                        })
+                
+                # Extract embedded images
+                embedded_images = self.extract_images_from_xlsx(excel_path)
+                for img_index, image in enumerate(embedded_images):
+                    visual_content = self.extract_content_from_image(image, "visual")
+                    if visual_content.strip() and "no visual elements found" not in visual_content.lower():
+                        processed_content["visuals"].append({
+                            "content": visual_content,
+                            "page": f"embedded_image_{img_index + 1}",
+                            "source": excel_path,
+                            "type": "embedded_image"
+                        })
+                
+                workbook.close()
+                
+            elif file_ext == '.xls':
+                workbook = xlrd.open_workbook(excel_path)
+                
+                for sheet_index in range(workbook.nsheets):
+                    sheet = workbook.sheet_by_index(sheet_index)
+                    sheet_name = workbook.sheet_names()[sheet_index]
+                    
+                    # Extract sheet data as tables
+                    sheet_data = self._extract_xls_sheet_data(sheet, sheet_name)
+                    if sheet_data:
+                        processed_content["tables"].append({
+                            "content": sheet_data,
+                            "page": sheet_index + 1,
+                            "source": excel_path,
+                            "type": "excel_sheet",
+                            "sheet_name": sheet_name
+                        })
+            
+            return processed_content
+            
+        except Exception as e:
+            print(f"Error processing Excel document: {e}")
+            return {"text": [], "tables": [], "visuals": []}
+    
+    def _extract_xlsx_sheet_data(self, sheet, sheet_name: str) -> str:
+        """Extract data from XLSX sheet and format as markdown table"""
+        try:
+            # Get sheet dimensions
+            max_row = sheet.max_row
+            max_col = sheet.max_column
+            
+            if max_row == 1 and max_col == 1 and not sheet.cell(1, 1).value:
+                return ""  # Empty sheet
+            
+            # Extract data
+            data = []
+            for row in range(1, min(max_row + 1, 101)):  # Limit to first 100 rows
+                row_data = []
+                for col in range(1, min(max_col + 1, 21)):  # Limit to first 20 columns
+                    cell_value = sheet.cell(row, col).value
+                    if cell_value is None:
+                        cell_value = ""
+                    row_data.append(str(cell_value))
+                data.append(row_data)
+            
+            if not data:
+                return ""
+            
+            # Format as markdown table
+            markdown_table = f"### Sheet: {sheet_name}\n\n"
+            
+            # Create header
+            if len(data) > 0:
+                headers = data[0]
+                markdown_table += "| " + " | ".join(headers) + " |\n"
+                markdown_table += "|" + "|".join(["---"] * len(headers)) + "|\n"
+                
+                # Add data rows
+                for row in data[1:]:
+                    if len(row) == len(headers):  # Ensure consistent column count
+                        markdown_table += "| " + " | ".join(row) + " |\n"
+            
+            return markdown_table
+            
+        except Exception as e:
+            print(f"Error extracting XLSX sheet data: {e}")
+            return ""
+    
+    def _extract_xls_sheet_data(self, sheet, sheet_name: str) -> str:
+        """Extract data from XLS sheet and format as markdown table"""
+        try:
+            nrows = sheet.nrows
+            ncols = sheet.ncols
+            
+            if nrows == 0 or ncols == 0:
+                return ""  # Empty sheet
+            
+            # Extract data
+            data = []
+            for row in range(min(nrows, 101)):  # Limit to first 100 rows
+                row_data = []
+                for col in range(min(ncols, 21)):  # Limit to first 20 columns
+                    cell_value = sheet.cell_value(row, col)
+                    if cell_value is None or cell_value == "":
+                        cell_value = ""
+                    row_data.append(str(cell_value))
+                data.append(row_data)
+            
+            if not data:
+                return ""
+            
+            # Format as markdown table
+            markdown_table = f"### Sheet: {sheet_name}\n\n"
+            
+            # Create header
+            if len(data) > 0:
+                headers = data[0]
+                markdown_table += "| " + " | ".join(headers) + " |\n"
+                markdown_table += "|" + "|".join(["---"] * len(headers)) + "|\n"
+                
+                # Add data rows
+                for row in data[1:]:
+                    if len(row) == len(headers):  # Ensure consistent column count
+                        markdown_table += "| " + " | ".join(row) + " |\n"
+            
+            return markdown_table
+            
+        except Exception as e:
+            print(f"Error extracting XLS sheet data: {e}")
+            return ""
         """Process a single page and extract all content types"""
         image = page_data['image']
         page_num = page_data['page_num']
@@ -204,115 +602,129 @@ class DocumentProcessor:
         """Process document with parallel processing"""
         file_ext = os.path.splitext(file_path)[1].lower()
         
-        if file_ext == '.pdf':
+        # Handle different file types
+        if file_ext == '.eml':
+            return self.process_eml_document(file_path)
+        elif file_ext in ['.xls', '.xlsx']:
+            return self.process_excel_document(file_path)
+        elif file_ext == '.pdf':
             images = self.convert_pdf_to_images(file_path)
         elif file_ext == '.pptx':
             images = self.convert_pptx_to_images(file_path)
         else:
             raise ValueError(f"Unsupported file type: {file_ext}")
         
-        processed_content = {
-            "text": [],
-            "tables": [],
-            "visuals": []
-        }
-        
-        if not Config.ENABLE_MULTIPROCESSING or len(images) < 2:
-            # Fall back to sequential processing for small documents
-            return self.process_document(file_path)
-        
-        # Prepare page data for parallel processing
-        page_data_list = [
-            {
-                'image': image,
-                'page_num': page_num + 1,
-                'file_path': file_path
-            }
-            for page_num, image in enumerate(images)
-        ]
-        
-        # Process pages in parallel
-        print(f"Processing {len(images)} pages with {Config.MAX_WORKERS} workers...")
-        
-        with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
-            # Submit all pages for processing
-            future_to_page = {
-                executor.submit(self.process_page, page_data): page_data['page_num']
-                for page_data in page_data_list
+        # For image-based processing (PDF, PPTX)
+        if file_ext in ['.pdf', '.pptx']:
+            processed_content = {
+                "text": [],
+                "tables": [],
+                "visuals": []
             }
             
-            # Collect results as they complete
-            results = {}
-            for future in as_completed(future_to_page):
-                page_num = future_to_page[future]
-                try:
-                    result = future.result()
-                    results[result['page_num']] = result
-                    print(f"✓ Completed page {result['page_num']}/{len(images)}")
-                except Exception as e:
-                    print(f"✗ Error processing page {page_num}: {e}")
-        
-        # Sort results by page number and collect
-        for page_num in sorted(results.keys()):
-            result = results[page_num]
+            if not Config.ENABLE_MULTIPROCESSING or len(images) < 2:
+                # Fall back to sequential processing for small documents
+                return self.process_document(file_path)
             
-            if result['text']:
-                processed_content["text"].append(result['text'])
-            if result['table']:
-                processed_content["tables"].append(result['table'])
-            if result['visual']:
-                processed_content["visuals"].append(result['visual'])
-        
-        return processed_content
+            # Prepare page data for parallel processing
+            page_data_list = [
+                {
+                    'image': image,
+                    'page_num': page_num + 1,
+                    'file_path': file_path
+                }
+                for page_num, image in enumerate(images)
+            ]
+            
+            # Process pages in parallel
+            print(f"Processing {len(images)} pages with {Config.MAX_WORKERS} workers...")
+            
+            with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
+                # Submit all pages for processing
+                future_to_page = {
+                    executor.submit(self.process_page, page_data): page_data['page_num']
+                    for page_data in page_data_list
+                }
+                
+                # Collect results as they complete
+                results = {}
+                for future in as_completed(future_to_page):
+                    page_num = future_to_page[future]
+                    try:
+                        result = future.result()
+                        results[result['page_num']] = result
+                        print(f"✓ Completed page {result['page_num']}/{len(images)}")
+                    except Exception as e:
+                        print(f"✗ Error processing page {page_num}: {e}")
+            
+            # Sort results by page number and collect
+            for page_num in sorted(results.keys()):
+                result = results[page_num]
+                
+                if result['text']:
+                    processed_content["text"].append(result['text'])
+                if result['table']:
+                    processed_content["tables"].append(result['table'])
+                if result['visual']:
+                    processed_content["visuals"].append(result['visual'])
+            
+            return processed_content
     
     def process_document(self, file_path: str) -> Dict[str, List[Dict[str, Any]]]:
         """Process document and extract all content types"""
         file_ext = os.path.splitext(file_path)[1].lower()
         
-        if file_ext == '.pdf':
+        # Handle different file types
+        if file_ext == '.eml':
+            return self.process_eml_document(file_path)
+        elif file_ext in ['.xls', '.xlsx']:
+            return self.process_excel_document(file_path)
+        elif file_ext == '.pdf':
             images = self.convert_pdf_to_images(file_path)
         elif file_ext == '.pptx':
             images = self.convert_pptx_to_images(file_path)
         else:
             raise ValueError(f"Unsupported file type: {file_ext}")
         
-        processed_content = {
-            "text": [],
-            "tables": [],
-            "visuals": []
-        }
-        
-        for page_num, image in enumerate(images):
-            print(f"Processing page {page_num + 1}...")
+        # For image-based processing (PDF, PPTX)
+        if file_ext in ['.pdf', '.pptx']:
+            processed_content = {
+                "text": [],
+                "tables": [],
+                "visuals": []
+            }
             
-            # Extract text content
-            text_content = self.extract_content_from_image(image, "text")
-            if text_content.strip() and "no text content found" not in text_content.lower():
-                processed_content["text"].append({
-                    "content": text_content,
-                    "page": page_num + 1,
-                    "source": file_path,
-                    "type": "text"
-                })
+            for page_num, image in enumerate(images):
+                print(f"Processing page {page_num + 1}...")
+                
+                # Extract text content
+                text_content = self.extract_content_from_image(image, "text")
+                if text_content.strip() and "no text content found" not in text_content.lower():
+                    processed_content["text"].append({
+                        "content": text_content,
+                        "page": page_num + 1,
+                        "source": file_path,
+                        "type": "text"
+                    })
+                
+                # Extract table content
+                table_content = self.extract_content_from_image(image, "table")
+                if table_content.strip() and "no tables found" not in table_content.lower():
+                    processed_content["tables"].append({
+                        "content": table_content,
+                        "page": page_num + 1,
+                        "source": file_path,
+                        "type": "table"
+                    })
+                
+                # Extract visual content
+                visual_content = self.extract_content_from_image(image, "visual")
+                if visual_content.strip() and "no visual elements found" not in visual_content.lower():
+                    processed_content["visuals"].append({
+                        "content": visual_content,
+                        "page": page_num + 1,
+                        "source": file_path,
+                        "type": "visual"
+                    })
             
-            # Extract table content
-            table_content = self.extract_content_from_image(image, "table")
-            if table_content.strip() and "no tables found" not in table_content.lower():
-                processed_content["tables"].append({
-                    "content": table_content,
-                    "page": page_num + 1,
-                    "source": file_path,
-                    "type": "table"
-                })
-            
-            # Extract visual content
-            visual_content = self.extract_content_from_image(image, "visual")
-            if visual_content.strip() and "no visual elements found" not in visual_content.lower():
-                processed_content["visuals"].append({
-                    "content": visual_content,
-                    "page": page_num + 1,
-                    "source": file_path,
-                    "type": "visual"
-                })
-        
-        return processed_content
+            return processed_content

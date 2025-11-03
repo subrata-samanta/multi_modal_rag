@@ -13,3 +13,7 @@ pillow
 pydantic
 python-dotenv
 tqdm
+openpyxl
+xlrd
+email-parser
+python-email
