@@ -1,5 +1,6 @@
 from typing import List, Dict, Any, Optional
 import os
+import json
 from langchain_google_vertexai import ChatVertexAI, VertexAIEmbeddings
 from langchain_chroma import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -79,6 +80,7 @@ class MultiModalVectorStore:
         
         if text_docs:
             self.text_store.add_documents(text_docs)
+            print(f"✓ Added {len(text_docs)} text documents to vector store")
         
         # Process table content
         table_docs = []
@@ -96,6 +98,7 @@ class MultiModalVectorStore:
         
         if table_docs:
             self.table_store.add_documents(table_docs)
+            print(f"✓ Added {len(table_docs)} table documents to vector store")
         
         # Process visual content
         visual_docs = []
@@ -113,6 +116,47 @@ class MultiModalVectorStore:
         
         if visual_docs:
             self.visual_store.add_documents(visual_docs)
+            print(f"✓ Added {len(visual_docs)} visual documents to vector store")
+    
+    def add_documents_from_extraction_file(self, extraction_file_path: str):
+        """Load and add documents from a saved extraction file"""
+        try:
+            with open(extraction_file_path, 'r', encoding='utf-8') as f:
+                extraction_data = json.load(f)
+            
+            processed_content = extraction_data.get("content", {})
+            source_file = extraction_data.get("source_file", "")
+            
+            print(f"Loading documents from extraction: {os.path.basename(source_file)}")
+            self.add_documents(processed_content)
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error loading from extraction file {extraction_file_path}: {e}")
+            return False
+    
+    def add_documents_from_multiple_extractions(self, extraction_directory: str = "document_extractions/content"):
+        """Load and add documents from all extraction files in a directory"""
+        if not os.path.exists(extraction_directory):
+            print(f"Extraction directory not found: {extraction_directory}")
+            return
+        
+        extraction_files = [f for f in os.listdir(extraction_directory) if f.endswith('.json')]
+        
+        if not extraction_files:
+            print("No extraction files found")
+            return
+        
+        print(f"Found {len(extraction_files)} extraction files")
+        
+        success_count = 0
+        for filename in extraction_files:
+            filepath = os.path.join(extraction_directory, filename)
+            if self.add_documents_from_extraction_file(filepath):
+                success_count += 1
+        
+        print(f"✓ Successfully loaded {success_count}/{len(extraction_files)} extraction files to vector store")
     
     def search_relevant_content(self, query: str, k: int = 3) -> Dict[str, List[Document]]:
         """Search across all content types and return relevant documents"""

@@ -90,9 +90,13 @@ def ingest_mode(rag):
     print("\n=== INGESTION MODE ===")
     print("1. Ingest Single Document")
     print("2. Ingest Folder")
-    print("3. Back to Main Menu")
+    print("3. Load from Saved Extractions")
+    print("4. View Extraction Cache Status")
+    print("5. Clear Old Extractions")
+    print("6. Force Reprocess Document")
+    print("7. Back to Main Menu")
     
-    choice = input("\nEnter your choice (1-3): ").strip()
+    choice = input("\nEnter your choice (1-7): ").strip()
     
     if choice == "1":
         file_path = input("Enter the path to your document file (PDF, PPTX, EML, XLS, XLSX): ").strip()
@@ -105,70 +109,30 @@ def ingest_mode(rag):
             print("Unsupported file type. Please use PDF, PPTX, EML, XLS, or XLSX files.")
             return
         
-        # Ask for parallel processing
-        use_parallel = input("Use parallel processing for faster extraction? (y/n, default: y): ").strip().lower()
-        use_parallel = use_parallel != 'n'
+        # Check if document has cached extraction
+        if rag.document_processor.has_saved_extraction(file_path):
+            use_cache = input("Found cached extraction. Use cache? (y/n, default: y): ").strip().lower()
+            force_reprocess = use_cache == 'n'
+        else:
+            force_reprocess = False
         
         try:
             print(f"\nProcessing document: {file_path}")
             
-            # Create log file path
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            output_dir = os.path.join(base_dir, "extraction_logs")
-            os.makedirs(output_dir, exist_ok=True)
-            
-            original_filename = os.path.splitext(os.path.basename(file_path))[0]
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            log_filename = f"{original_filename}_{timestamp}.txt"
-            log_path = os.path.join(output_dir, log_filename)
-            
-            # Open log file
-            with open(log_path, 'w', encoding='utf-8') as log_file:
-                log_file.write(f"{'='*80}\n")
-                log_file.write(f"EXTRACTION LOG [SUCCESS]\n")
-                log_file.write(f"{'='*80}\n")
-                log_file.write(f"Source File: {file_path}\n")
-                log_file.write(f"Extraction Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                log_file.write(f"Processing Mode: {'Parallel' if use_parallel else 'Sequential'}\n")
-                log_file.write(f"{'='*80}\n\n")
-                
-                # Ingest document with page-by-page logging
-                if use_parallel:
-                    extracted_content = rag.ingest_document_with_parallel_logging(
-                        file_path, log_file, display_and_log_page_content
-                    )
-                else:
-                    extracted_content = rag.ingest_document_with_logging(
-                        file_path, log_file, display_and_log_page_content
-                    )
+            result = rag.ingest_document(file_path, force_reprocess)
             
             print("\n✓ Document ingested successfully!")
-            print(f"✓ Extraction log saved to: {log_path}")
+            
+            # Show extraction stats
+            text_count = len(result.get('text', []))
+            table_count = len(result.get('tables', []))
+            visual_count = len(result.get('visuals', []))
+            print(f"  - Text items: {text_count}")
+            print(f"  - Table items: {table_count}")
+            print(f"  - Visual items: {visual_count}")
             
         except Exception as e:
-            error_msg = str(e)
-            
-            # Create error log
-            error_content = f"ERROR DETAILS:\n{'-'*80}\n"
-            error_content += f"Error Type: {type(e).__name__}\n"
-            error_content += f"Error Message: {error_msg}\n"
-            error_content += f"\nFull Traceback:\n{'-'*80}\n"
-            
-            import traceback
-            error_content += traceback.format_exc()
-            
-            # Save error log
-            log_path = save_extraction_log(file_path, error_content, is_error=True)
-            
-            if "zlib error" in error_msg or "incorrect header" in error_msg:
-                print(f"✗ Error: The PDF file appears to be corrupted or has an invalid format.")
-                print(f"  Please verify the file integrity or try re-downloading/re-saving the PDF.")
-            elif "MuPDF error" in error_msg:
-                print(f"✗ Error: Unable to read the PDF file. The file may be corrupted or password-protected.")
-            else:
-                print(f"✗ Error processing document: {e}")
-            
-            print(f"✗ Error log saved to: {log_path}")
+            print(f"✗ Error processing document: {e}")
     
     elif choice == "2":
         folder_path = input("Enter the path to the folder containing document files (PDF, PPTX, EML, XLS, XLSX): ").strip()
@@ -181,114 +145,79 @@ def ingest_mode(rag):
             print("The provided path is not a folder.")
             return
         
-        # Ask for parallel processing
-        use_parallel = input("Use parallel processing for faster extraction? (y/n, default: y): ").strip().lower()
-        use_parallel = use_parallel != 'n'
+        # Ask for force reprocessing
+        force_reprocess = input("Force reprocess all files (ignore cache)? (y/n, default: n): ").strip().lower() == 'y'
         
         try:
-            # Get all supported files in the folder
-            files = [f for f in os.listdir(folder_path) 
-                    if f.lower().endswith(('.pdf', '.pptx', '.eml', '.xls', '.xlsx'))]
+            results = rag.ingest_folder_with_caching(folder_path, force_reprocess)
             
-            if not files:
-                print("No supported files found in the folder. Supported formats: PDF, PPTX, EML, XLS, XLSX.")
-                return
-            
-            print(f"\nFound {len(files)} file(s) to process:")
-            for f in files:
-                print(f"  - {f}")
-            
-            confirm = input("\nProceed with ingestion? (y/n): ").strip().lower()
-            if confirm != 'y':
-                print("Folder ingestion cancelled.")
-                return
-            
-            successful = 0
-            failed = 0
-            corrupted_files = []
-            
-            for idx, filename in enumerate(files, 1):
-                file_path = os.path.join(folder_path, filename)
-                try:
-                    print(f"\n{'#'*80}")
-                    print(f"Processing file {idx}/{len(files)}: {filename}...")
-                    print(f"{'#'*80}")
-                    
-                    # Create log file path
-                    base_dir = os.path.dirname(os.path.abspath(__file__))
-                    output_dir = os.path.join(base_dir, "extraction_logs")
-                    os.makedirs(output_dir, exist_ok=True)
-                    
-                    original_filename = os.path.splitext(os.path.basename(file_path))[0]
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    log_filename = f"{original_filename}_{timestamp}.txt"
-                    log_path = os.path.join(output_dir, log_filename)
-                    
-                    # Open log file
-                    with open(log_path, 'w', encoding='utf-8') as log_file:
-                        log_file.write(f"{'='*80}\n")
-                        log_file.write(f"EXTRACTION LOG [SUCCESS]\n")
-                        log_file.write(f"{'='*80}\n")
-                        log_file.write(f"Source File: {file_path}\n")
-                        log_file.write(f"Extraction Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                        log_file.write(f"Processing Mode: {'Parallel' if use_parallel else 'Sequential'}\n")
-                        log_file.write(f"{'='*80}\n\n")
-                        
-                        # Ingest document with page-by-page logging
-                        if use_parallel:
-                            extracted_content = rag.ingest_document_with_parallel_logging(
-                                file_path, log_file, display_and_log_page_content
-                            )
-                        else:
-                            extracted_content = rag.ingest_document_with_logging(
-                                file_path, log_file, display_and_log_page_content
-                            )
-                    
-                    print(f"\n✓ Successfully ingested: {filename}")
-                    print(f"  Log saved: {os.path.basename(log_path)}")
-                    successful += 1
-                    
-                except Exception as e:
-                    error_msg = str(e)
-                    
-                    # Create error log
-                    error_content = f"ERROR DETAILS:\n{'-'*80}\n"
-                    error_content += f"Error Type: {type(e).__name__}\n"
-                    error_content += f"Error Message: {error_msg}\n"
-                    error_content += f"\nFull Traceback:\n{'-'*80}\n"
-                    
-                    import traceback
-                    error_content += traceback.format_exc()
-                    
-                    # Save error log
-                    log_path = save_extraction_log(file_path, error_content, is_error=True)
-                    
-                    if "zlib error" in error_msg or "incorrect header" in error_msg or "MuPDF error" in error_msg:
-                        print(f"✗ Failed: {filename} (corrupted or invalid format)")
-                        corrupted_files.append(filename)
-                    else:
-                        print(f"✗ Failed to ingest {filename}: {e}")
-                    
-                    print(f"  Error log saved: {os.path.basename(log_path)}")
-                    failed += 1
-            
-            print(f"\n{'='*80}")
-            print(f"=== Ingestion Complete ===")
-            print(f"Successfully ingested: {successful} file(s)")
-            print(f"Failed: {failed} file(s)")
-            if corrupted_files:
-                print(f"\nCorrupted/Invalid files:")
-                for cf in corrupted_files:
-                    print(f"  - {cf}")
-            
-            # Show extraction logs location
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            logs_dir = os.path.join(base_dir, "extraction_logs")
-            print(f"\nExtraction logs saved to: {logs_dir}")
-            print(f"{'='*80}")
+            print(f"\n✓ Folder ingestion complete!")
+            print(f"Processed {len(results)} files")
             
         except Exception as e:
-            print(f"Error processing folder: {e}")
+            print(f"✗ Error processing folder: {e}")
+    
+    elif choice == "3":
+        # Load from saved extractions
+        extraction_dir = input("Enter extraction directory path (default: document_extractions/content): ").strip()
+        if not extraction_dir:
+            extraction_dir = "document_extractions/content"
+        
+        try:
+            rag.ingest_from_saved_extractions(extraction_dir)
+        except Exception as e:
+            print(f"✗ Error loading saved extractions: {e}")
+    
+    elif choice == "4":
+        # View extraction cache status
+        try:
+            rag.get_extraction_status()
+        except Exception as e:
+            print(f"✗ Error getting extraction status: {e}")
+    
+    elif choice == "5":
+        # Clear old extractions
+        days = input("Enter number of days to keep recent extractions (default: 30): ").strip()
+        try:
+            keep_days = int(days) if days else 30
+            rag.clear_old_extractions(keep_days)
+        except ValueError:
+            print("Invalid number of days. Using default (30 days).")
+            rag.clear_old_extractions(30)
+        except Exception as e:
+            print(f"✗ Error clearing extractions: {e}")
+    
+    elif choice == "6":
+        # Force reprocess document
+        file_path = input("Enter the path to the document to force reprocess: ").strip()
+        
+        if not os.path.exists(file_path):
+            print("File not found. Please check the path.")
+            return
+        
+        if not file_path.lower().endswith(('.pdf', '.pptx', '.eml', '.xls', '.xlsx')):
+            print("Unsupported file type. Please use PDF, PPTX, EML, XLS, or XLSX files.")
+            return
+        
+        try:
+            result = rag.force_reprocess_document(file_path)
+            print("\n✓ Document reprocessed and ingested successfully!")
+            
+            # Show extraction stats
+            text_count = len(result.get('text', []))
+            table_count = len(result.get('tables', []))
+            visual_count = len(result.get('visuals', []))
+            print(f"  - Text items: {text_count}")
+            print(f"  - Table items: {table_count}")
+            print(f"  - Visual items: {visual_count}")
+            
+        except Exception as e:
+            print(f"✗ Error reprocessing document: {e}")
+    
+    elif choice == "7":
+        return
+    else:
+        print("Invalid choice. Please try again.")
 
 def inference_mode(rag):
     """Handle question answering with mode selection"""

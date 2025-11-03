@@ -19,6 +19,9 @@ import xlrd
 from openpyxl.drawing.image import Image as OpenpyxlImage
 import zipfile
 import tempfile
+import json
+import hashlib
+from datetime import datetime
 
 class DocumentProcessor:
     def __init__(self):
@@ -27,6 +30,15 @@ class DocumentProcessor:
             model_name="gemini-2.5-pro"
         )
         self._thread_local = threading.local()
+        
+        # Create directories for saving extractions
+        self.extractions_dir = "document_extractions"
+        self.images_dir = os.path.join(self.extractions_dir, "images")
+        self.content_dir = os.path.join(self.extractions_dir, "content")
+        
+        os.makedirs(self.extractions_dir, exist_ok=True)
+        os.makedirs(self.images_dir, exist_ok=True)
+        os.makedirs(self.content_dir, exist_ok=True)
         
     def _setup_authentication(self):
         """Setup Google authentication using service account key file"""
@@ -44,6 +56,92 @@ class DocumentProcessor:
                 model_name="gemini-2.5-pro"
             )
         return self._thread_local.llm
+    
+    def _get_file_hash(self, file_path: str) -> str:
+        """Generate MD5 hash of file for caching"""
+        hash_md5 = hashlib.md5()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+    
+    def _get_extraction_file_path(self, file_path: str) -> str:
+        """Get the path where extraction results should be saved"""
+        file_hash = self._get_file_hash(file_path)
+        filename = os.path.basename(file_path)
+        extraction_filename = f"{filename}_{file_hash}.json"
+        return os.path.join(self.content_dir, extraction_filename)
+    
+    def _save_image(self, image: Image.Image, file_path: str, page_num: int, content_type: str) -> str:
+        """Save image to disk and return the saved path"""
+        try:
+            file_hash = self._get_file_hash(file_path)
+            filename = os.path.basename(file_path)
+            base_name = os.path.splitext(filename)[0]
+            
+            image_filename = f"{base_name}_{file_hash}_page{page_num}_{content_type}.png"
+            image_path = os.path.join(self.images_dir, image_filename)
+            
+            image.save(image_path, "PNG")
+            return image_path
+        except Exception as e:
+            print(f"Error saving image: {e}")
+            return ""
+    
+    def _save_extraction_results(self, file_path: str, processed_content: Dict[str, List[Dict[str, Any]]]):
+        """Save extraction results to JSON file"""
+        try:
+            extraction_path = self._get_extraction_file_path(file_path)
+            
+            # Add metadata
+            extraction_data = {
+                "source_file": file_path,
+                "file_hash": self._get_file_hash(file_path),
+                "extraction_date": datetime.now().isoformat(),
+                "content": processed_content
+            }
+            
+            with open(extraction_path, 'w', encoding='utf-8') as f:
+                json.dump(extraction_data, f, indent=2, ensure_ascii=False)
+            
+            print(f"✓ Saved extraction results to: {extraction_path}")
+            return extraction_path
+            
+        except Exception as e:
+            print(f"Error saving extraction results: {e}")
+            return None
+    
+    def _load_saved_extraction(self, file_path: str) -> Dict[str, List[Dict[str, Any]]]:
+        """Load previously saved extraction results"""
+        try:
+            extraction_path = self._get_extraction_file_path(file_path)
+            
+            if not os.path.exists(extraction_path):
+                return None
+            
+            # Check if source file has been modified since extraction
+            current_hash = self._get_file_hash(file_path)
+            
+            with open(extraction_path, 'r', encoding='utf-8') as f:
+                extraction_data = json.load(f)
+            
+            saved_hash = extraction_data.get("file_hash", "")
+            
+            if current_hash != saved_hash:
+                print(f"File has been modified since extraction. Re-processing required.")
+                return None
+            
+            print(f"✓ Loaded cached extraction from: {extraction_path}")
+            return extraction_data["content"]
+            
+        except Exception as e:
+            print(f"Error loading saved extraction: {e}")
+            return None
+    
+    def has_saved_extraction(self, file_path: str) -> bool:
+        """Check if file has saved extraction that is still valid"""
+        saved_content = self._load_saved_extraction(file_path)
+        return saved_content is not None
     
     def _image_to_base64(self, image: Image.Image) -> str:
         """Convert PIL Image to base64 string"""
@@ -558,6 +656,7 @@ class DocumentProcessor:
         image = page_data['image']
         page_num = page_data['page_num']
         file_path = page_data['file_path']
+        image_path = page_data.get('image_path', '')
         
         result = {
             'page_num': page_num,
@@ -573,7 +672,8 @@ class DocumentProcessor:
                 "content": text_content,
                 "page": page_num,
                 "source": file_path,
-                "type": "text"
+                "type": "text",
+                "image_path": image_path
             }
         
         # Extract table content
@@ -583,7 +683,8 @@ class DocumentProcessor:
                 "content": table_content,
                 "page": page_num,
                 "source": file_path,
-                "type": "table"
+                "type": "table",
+                "image_path": image_path
             }
         
         # Extract visual content
@@ -593,138 +694,215 @@ class DocumentProcessor:
                 "content": visual_content,
                 "page": page_num,
                 "source": file_path,
-                "type": "visual"
+                "type": "visual",
+                "image_path": image_path
             }
         
         return result
     
-    def process_document_parallel(self, file_path: str) -> Dict[str, List[Dict[str, Any]]]:
-        """Process document with parallel processing"""
+    def process_document_parallel(self, file_path: str, force_reprocess: bool = False) -> Dict[str, List[Dict[str, Any]]]:
+        """Process document with parallel processing and caching"""
+        
+        # Check for cached extraction first
+        if not force_reprocess:
+            saved_content = self._load_saved_extraction(file_path)
+            if saved_content is not None:
+                return saved_content
+        
+        print(f"Processing document: {file_path}")
+        
         file_ext = os.path.splitext(file_path)[1].lower()
         
         # Handle different file types
         if file_ext == '.eml':
-            return self.process_eml_document(file_path)
+            processed_content = self.process_eml_document(file_path)
         elif file_ext in ['.xls', '.xlsx']:
-            return self.process_excel_document(file_path)
+            processed_content = self.process_excel_document(file_path)
         elif file_ext == '.pdf':
             images = self.convert_pdf_to_images(file_path)
+            processed_content = self._process_images_parallel(file_path, images)
         elif file_ext == '.pptx':
             images = self.convert_pptx_to_images(file_path)
+            processed_content = self._process_images_parallel(file_path, images)
         else:
             raise ValueError(f"Unsupported file type: {file_ext}")
         
-        # For image-based processing (PDF, PPTX)
-        if file_ext in ['.pdf', '.pptx']:
-            processed_content = {
-                "text": [],
-                "tables": [],
-                "visuals": []
-            }
-            
-            if not Config.ENABLE_MULTIPROCESSING or len(images) < 2:
-                # Fall back to sequential processing for small documents
-                return self.process_document(file_path)
-            
-            # Prepare page data for parallel processing
-            page_data_list = [
-                {
-                    'image': image,
-                    'page_num': page_num + 1,
-                    'file_path': file_path
-                }
-                for page_num, image in enumerate(images)
-            ]
-            
-            # Process pages in parallel
-            print(f"Processing {len(images)} pages with {Config.MAX_WORKERS} workers...")
-            
-            with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
-                # Submit all pages for processing
-                future_to_page = {
-                    executor.submit(self.process_page, page_data): page_data['page_num']
-                    for page_data in page_data_list
-                }
-                
-                # Collect results as they complete
-                results = {}
-                for future in as_completed(future_to_page):
-                    page_num = future_to_page[future]
-                    try:
-                        result = future.result()
-                        results[result['page_num']] = result
-                        print(f"✓ Completed page {result['page_num']}/{len(images)}")
-                    except Exception as e:
-                        print(f"✗ Error processing page {page_num}: {e}")
-            
-            # Sort results by page number and collect
-            for page_num in sorted(results.keys()):
-                result = results[page_num]
-                
-                if result['text']:
-                    processed_content["text"].append(result['text'])
-                if result['table']:
-                    processed_content["tables"].append(result['table'])
-                if result['visual']:
-                    processed_content["visuals"].append(result['visual'])
-            
-            return processed_content
+        # Save extraction results
+        self._save_extraction_results(file_path, processed_content)
+        
+        return processed_content
     
-    def process_document(self, file_path: str) -> Dict[str, List[Dict[str, Any]]]:
-        """Process document and extract all content types"""
+    def _process_images_parallel(self, file_path: str, images: List[Image.Image]) -> Dict[str, List[Dict[str, Any]]]:
+        """Process images in parallel and save individual page images"""
+        processed_content = {
+            "text": [],
+            "tables": [],
+            "visuals": []
+        }
+        
+        if not Config.ENABLE_MULTIPROCESSING or len(images) < 2:
+            # Fall back to sequential processing for small documents
+            return self._process_images_sequential(file_path, images)
+        
+        # Save images first
+        saved_images = []
+        for page_num, image in enumerate(images):
+            image_path = self._save_image(image, file_path, page_num + 1, "page")
+            saved_images.append({
+                'image': image,
+                'image_path': image_path,
+                'page_num': page_num + 1,
+                'file_path': file_path
+            })
+        
+        # Prepare page data for parallel processing
+        page_data_list = saved_images
+        
+        # Process pages in parallel
+        print(f"Processing {len(images)} pages with {Config.MAX_WORKERS} workers...")
+        
+        with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
+            # Submit all pages for processing
+            future_to_page = {
+                executor.submit(self.process_page, page_data): page_data['page_num']
+                for page_data in page_data_list
+            }
+            
+            # Collect results as they complete
+            results = {}
+            for future in as_completed(future_to_page):
+                page_num = future_to_page[future]
+                try:
+                    result = future.result()
+                    results[result['page_num']] = result
+                    print(f"✓ Completed page {result['page_num']}/{len(images)}")
+                except Exception as e:
+                    print(f"✗ Error processing page {page_num}: {e}")
+        
+        # Sort results by page number and collect
+        for page_num in sorted(results.keys()):
+            result = results[page_num]
+            
+            if result['text']:
+                processed_content["text"].append(result['text'])
+            if result['table']:
+                processed_content["tables"].append(result['table'])
+            if result['visual']:
+                processed_content["visuals"].append(result['visual'])
+        
+        return processed_content
+    
+    def _process_images_sequential(self, file_path: str, images: List[Image.Image]) -> Dict[str, List[Dict[str, Any]]]:
+        """Process images sequentially and save individual page images"""
+        processed_content = {
+            "text": [],
+            "tables": [],
+            "visuals": []
+        }
+        
+        for page_num, image in enumerate(images):
+            print(f"Processing page {page_num + 1}...")
+            
+            # Save image
+            image_path = self._save_image(image, file_path, page_num + 1, "page")
+            
+            # Extract text content
+            text_content = self.extract_content_from_image(image, "text")
+            if text_content.strip() and "no text content found" not in text_content.lower():
+                processed_content["text"].append({
+                    "content": text_content,
+                    "page": page_num + 1,
+                    "source": file_path,
+                    "type": "text",
+                    "image_path": image_path
+                })
+            
+            # Extract table content
+            table_content = self.extract_content_from_image(image, "table")
+            if table_content.strip() and "no tables found" not in table_content.lower():
+                processed_content["tables"].append({
+                    "content": table_content,
+                    "page": page_num + 1,
+                    "source": file_path,
+                    "type": "table",
+                    "image_path": image_path
+                })
+            
+            # Extract visual content
+            visual_content = self.extract_content_from_image(image, "visual")
+            if visual_content.strip() and "no visual elements found" not in visual_content.lower():
+                processed_content["visuals"].append({
+                    "content": visual_content,
+                    "page": page_num + 1,
+                    "source": file_path,
+                    "type": "visual",
+                    "image_path": image_path
+                })
+        
+        return processed_content
+    
+    def process_document(self, file_path: str, force_reprocess: bool = False) -> Dict[str, List[Dict[str, Any]]]:
+        """Process document and extract all content types with caching"""
+        
+        # Check for cached extraction first
+        if not force_reprocess:
+            saved_content = self._load_saved_extraction(file_path)
+            if saved_content is not None:
+                return saved_content
+        
+        print(f"Processing document: {file_path}")
+        
         file_ext = os.path.splitext(file_path)[1].lower()
         
         # Handle different file types
         if file_ext == '.eml':
-            return self.process_eml_document(file_path)
+            processed_content = self.process_eml_document(file_path)
         elif file_ext in ['.xls', '.xlsx']:
-            return self.process_excel_document(file_path)
+            processed_content = self.process_excel_document(file_path)
         elif file_ext == '.pdf':
             images = self.convert_pdf_to_images(file_path)
+            processed_content = self._process_images_sequential(file_path, images)
         elif file_ext == '.pptx':
             images = self.convert_pptx_to_images(file_path)
+            processed_content = self._process_images_sequential(file_path, images)
         else:
             raise ValueError(f"Unsupported file type: {file_ext}")
         
-        # For image-based processing (PDF, PPTX)
-        if file_ext in ['.pdf', '.pptx']:
-            processed_content = {
-                "text": [],
-                "tables": [],
-                "visuals": []
-            }
-            
-            for page_num, image in enumerate(images):
-                print(f"Processing page {page_num + 1}...")
-                
-                # Extract text content
-                text_content = self.extract_content_from_image(image, "text")
-                if text_content.strip() and "no text content found" not in text_content.lower():
-                    processed_content["text"].append({
-                        "content": text_content,
-                        "page": page_num + 1,
-                        "source": file_path,
-                        "type": "text"
+        # Save extraction results
+        self._save_extraction_results(file_path, processed_content)
+        
+        return processed_content
+    
+    def load_from_saved_extraction(self, file_path: str):
+        """Public method to load from saved extraction"""
+        return self._load_saved_extraction(file_path)
+    
+    def get_all_saved_extractions(self):
+        """Get list of all saved extractions with metadata"""
+        extractions = []
+        
+        if not os.path.exists(self.content_dir):
+            return extractions
+        
+        for filename in os.listdir(self.content_dir):
+            if filename.endswith('.json'):
+                filepath = os.path.join(self.content_dir, filename)
+                try:
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    
+                    extractions.append({
+                        'extraction_file': filepath,
+                        'source_file': data.get('source_file', ''),
+                        'file_hash': data.get('file_hash', ''),
+                        'extraction_date': data.get('extraction_date', ''),
+                        'content_stats': {
+                            'text_items': len(data.get('content', {}).get('text', [])),
+                            'table_items': len(data.get('content', {}).get('tables', [])),
+                            'visual_items': len(data.get('content', {}).get('visuals', []))
+                        }
                     })
-                
-                # Extract table content
-                table_content = self.extract_content_from_image(image, "table")
-                if table_content.strip() and "no tables found" not in table_content.lower():
-                    processed_content["tables"].append({
-                        "content": table_content,
-                        "page": page_num + 1,
-                        "source": file_path,
-                        "type": "table"
-                    })
-                
-                # Extract visual content
-                visual_content = self.extract_content_from_image(image, "visual")
-                if visual_content.strip() and "no visual elements found" not in visual_content.lower():
-                    processed_content["visuals"].append({
-                        "content": visual_content,
-                        "page": page_num + 1,
-                        "source": file_path,
-                        "type": "visual"
-                    })
-            
-            return processed_content
+                except Exception as e:
+                    print(f"Error reading extraction file {filename}: {e}")
+        
+        return extractions

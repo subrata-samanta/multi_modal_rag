@@ -30,20 +30,26 @@ class MultiModalRAGPipeline:
         except Exception as e:
             raise Exception(f"Failed to setup LLM: {e}")
     
-    def ingest_document(self, file_path: str):
-        """Ingest a document into the RAG pipeline"""
+    def ingest_document(self, file_path: str, force_reprocess: bool = False):
+        """Ingest a document into the RAG pipeline with caching support"""
         print(f"Processing document: {file_path}")
         
-        # Process document with parallel processing if enabled
-        if Config.ENABLE_MULTIPROCESSING:
-            processed_content = self.document_processor.process_document_parallel(file_path)
+        # Check if document has already been processed
+        if not force_reprocess and self.document_processor.has_saved_extraction(file_path):
+            print("Loading from cached extraction...")
+            processed_content = self.document_processor.load_from_saved_extraction(file_path)
         else:
-            processed_content = self.document_processor.process_document(file_path)
+            # Process document with parallel processing if enabled
+            if Config.ENABLE_MULTIPROCESSING:
+                processed_content = self.document_processor.process_document_parallel(file_path, force_reprocess)
+            else:
+                processed_content = self.document_processor.process_document(file_path, force_reprocess)
         
         # Add to vector stores
         self.vector_store.add_documents(processed_content)
         
         print("Document successfully ingested!")
+        return processed_content
     
     def ingest_document_with_logging(self, file_path: str, log_file, display_callback):
         """Ingest a document with page-by-page logging and display"""
@@ -448,3 +454,83 @@ class MultiModalRAGPipeline:
             "relevant_images": self.get_relevant_images(relevant_docs),
             "relevant_tables": self.extract_tables_from_context(relevant_docs)
         }
+    
+    def ingest_from_saved_extractions(self, extraction_directory: str = "document_extractions/content"):
+        """Ingest documents from all saved extraction files"""
+        print("Loading documents from saved extractions...")
+        self.vector_store.add_documents_from_multiple_extractions(extraction_directory)
+    
+    def ingest_folder_with_caching(self, folder_path: str, force_reprocess: bool = False):
+        """Process and ingest all documents in a folder with caching support"""
+        if not os.path.exists(folder_path) or not os.path.isdir(folder_path):
+            raise ValueError(f"Invalid folder path: {folder_path}")
+        
+        # Get all supported files
+        supported_extensions = ['.pdf', '.pptx', '.eml', '.xls', '.xlsx']
+        files = [
+            os.path.join(folder_path, f) 
+            for f in os.listdir(folder_path) 
+            if any(f.lower().endswith(ext) for ext in supported_extensions)
+        ]
+        
+        if not files:
+            print("No supported files found in folder")
+            return []
+        
+        print(f"Found {len(files)} file(s) to process")
+        
+        # Process files
+        results = self.document_processor.process_multiple_documents(files, force_reprocess)
+        
+        # Add all results to vector store
+        total_docs = 0
+        for file_path, content in results.items():
+            if content:
+                self.vector_store.add_documents(content)
+                total_docs += len(content.get('text', [])) + len(content.get('tables', [])) + len(content.get('visuals', []))
+        
+        print(f"✓ Successfully ingested {len(results)} files with {total_docs} total documents")
+        return results
+    
+    def get_extraction_status(self):
+        """Get status of all saved extractions"""
+        extractions = self.document_processor.get_all_saved_extractions()
+        
+        print(f"\n=== EXTRACTION CACHE STATUS ===")
+        print(f"Total saved extractions: {len(extractions)}")
+        
+        if not extractions:
+            print("No saved extractions found.")
+            return
+        
+        total_text = sum(ext['content_stats']['text_items'] for ext in extractions)
+        total_tables = sum(ext['content_stats']['table_items'] for ext in extractions)
+        total_visuals = sum(ext['content_stats']['visual_items'] for ext in extractions)
+        
+        print(f"Total extracted items:")
+        print(f"  - Text items: {total_text}")
+        print(f"  - Table items: {total_tables}")  
+        print(f"  - Visual items: {total_visuals}")
+        print(f"\nRecent extractions:")
+        
+        # Sort by extraction date and show recent ones
+        sorted_extractions = sorted(
+            extractions, 
+            key=lambda x: x['extraction_date'], 
+            reverse=True
+        )[:10]
+        
+        for ext in sorted_extractions:
+            source_name = os.path.basename(ext['source_file'])
+            stats = ext['content_stats']
+            print(f"  - {source_name}: {stats['text_items']}T/{stats['table_items']}TB/{stats['visual_items']}V ({ext['extraction_date'][:10]})")
+        
+        return extractions
+    
+    def clear_old_extractions(self, keep_recent_days: int = 30):
+        """Clear old extraction files to save space"""
+        self.document_processor.clear_saved_extractions(keep_recent_days)
+    
+    def force_reprocess_document(self, file_path: str):
+        """Force reprocessing of a document (ignore cache)"""
+        return self.ingest_document(file_path, force_reprocess=True)
