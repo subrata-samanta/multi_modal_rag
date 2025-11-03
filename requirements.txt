@@ -17,3 +17,6 @@ openpyxl
 xlrd
 email-parser
 python-email
+numpy
+imagehash
+aiohttp

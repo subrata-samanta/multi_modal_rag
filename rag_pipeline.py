@@ -1,57 +1,423 @@
-from typing import List, Dict, Any
+"""
+Multi-Modal RAG Pipeline
+
+A comprehensive Retrieval-Augmented Generation pipeline that processes multi-modal
+documents (PDF, PPTX, EML, Excel) and provides intelligent question-answering
+capabilities using Google Vertex AI.
+
+Features:
+- Multi-format document processing with AI-powered content extraction
+- Separate vector storage for text, tables, and visual content
+- Intelligent query analysis and contextual retrieval
+- Parallel processing for performance optimization
+- Comprehensive caching and performance monitoring
+
+"""
+
+from typing import List, Dict, Any, Optional, Tuple
 import os
-from langchain_google_vertexai import ChatVertexAI
-from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage
-from document_processor import DocumentProcessor
-from vector_store import MultiModalVectorStore
-from config import Config
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from tqdm import tqdm
+from datetime import datetime
+
+from langchain_google_vertexai import ChatVertexAI
+from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage
+
+from document_processor import DocumentProcessor
+from vector_store import MultiModalVectorStore
+from config import Config
+
 
 class MultiModalRAGPipeline:
+    """
+    Advanced RAG pipeline for multi-modal document processing and question answering.
+    
+    Integrates document processing, vector storage, and AI-powered retrieval
+    to provide comprehensive question-answering capabilities across different
+    content types (text, tables, visuals).
+    """
+    
     def __init__(self):
+        """Initialize the RAG pipeline with all required components."""
+        print("Initializing Multi-Modal RAG Pipeline...")
+        
+        # Initialize core components
         self.document_processor = DocumentProcessor()
         self.vector_store = MultiModalVectorStore()
-        self._setup_llm()
+        self._initialize_ai_generator()
+        
+        print("✓ RAG Pipeline initialized successfully")
     
-    def _setup_llm(self):
-        """Setup LLM with service account authentication"""
+    # =============================================================================
+    # SYSTEM INITIALIZATION
+    # =============================================================================
+    
+    def _initialize_ai_generator(self) -> None:
+        """
+        Initialize the AI text generation system with Google Vertex AI.
+        
+        Uses Gemini 2.5-pro for high-quality answer generation.
+        """
         try:
-            # Set environment variable for Google Application Credentials
+            # Configure Google Cloud credentials
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = Config.GOOGLE_CREDENTIALS_PATH
             
-            self.llm = ChatVertexAI(
+            # Initialize text generation model
+            self.answer_generator = ChatVertexAI(
                 model_name="gemini-2.5-pro",
-                temperature=0.1
+                temperature=0.1,  # Low temperature for consistent, factual responses
+                project=Config.GOOGLE_PROJECT_ID,
+                location=Config.GOOGLE_LOCATION
             )
+            
+            print("✓ AI answer generation system initialized")
+            
         except Exception as e:
-            raise Exception(f"Failed to setup LLM: {e}")
+            raise Exception(f"Failed to initialize AI generator: {e}")
     
-    def ingest_document(self, file_path: str, force_reprocess: bool = False):
-        """Ingest a document into the RAG pipeline with caching support"""
-        print(f"Processing document: {file_path}")
+    # =============================================================================
+    # DOCUMENT INGESTION OPERATIONS
+    # =============================================================================
+    
+    def ingest_single_document(self, file_path: str, force_reprocess: bool = False) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Ingest a single document into the RAG pipeline with intelligent caching.
         
-        # Check if document has already been processed
-        if not force_reprocess and self.document_processor.has_saved_extraction(file_path):
+        Args:
+            file_path: Path to the document file
+            force_reprocess: Whether to bypass cache and reprocess the document
+            
+        Returns:
+            Dictionary containing processed content organized by type
+        """
+        print(f"Ingesting document: {os.path.basename(file_path)}")
+        
+        # Reset duplicate detection for new document processing
+        self.document_processor.reset_duplicate_detection()
+        
+        # Check for cached processing results
+        if not force_reprocess and self.document_processor.has_valid_cache(file_path):
             print("Loading from cached extraction...")
             processed_content = self.document_processor.load_from_saved_extraction(file_path)
         else:
-            # Process document with parallel processing if enabled
+            # Process document with optimal strategy
             if Config.ENABLE_MULTIPROCESSING:
-                processed_content = self.document_processor.process_document_parallel(file_path, force_reprocess)
+                processed_content = self.document_processor.process_document_with_parallel_processing(
+                    file_path, force_reprocess
+                )
             else:
-                processed_content = self.document_processor.process_document(file_path, force_reprocess)
+                processed_content = self.document_processor.process_document(
+                    file_path, force_reprocess
+                )
         
-        # Add to vector stores
-        self.vector_store.add_documents(processed_content)
+        # Store processed content in vector collections
+        self.vector_store.store_processed_documents(processed_content)
         
-        print("Document successfully ingested!")
+        print("✓ Document successfully ingested into RAG pipeline")
         return processed_content
     
-    def ingest_document_with_logging(self, file_path: str, log_file, display_callback):
+    def ingest_folder_of_documents(self, folder_path: str, force_reprocess: bool = False) -> Dict[str, Any]:
+        """
+        Process and ingest all supported documents in a folder.
+        
+        Args:
+            folder_path: Path to folder containing documents
+            force_reprocess: Whether to bypass caching
+            
+        Returns:
+            Dictionary with processing results and statistics
+        """
+        if not os.path.exists(folder_path) or not os.path.isdir(folder_path):
+            raise ValueError(f"Invalid folder path: {folder_path}")
+        
+        # Find all supported document files
+        supported_extensions = ['.pdf', '.pptx', '.eml', '.xls', '.xlsx']
+        document_files = [
+            os.path.join(folder_path, filename) 
+            for filename in os.listdir(folder_path) 
+            if any(filename.lower().endswith(ext) for ext in supported_extensions)
+        ]
+        
+        if not document_files:
+            print("No supported document files found in folder")
+            return {"processed_files": [], "total_documents": 0}
+        
+        print(f"Found {len(document_files)} supported files to process")
+        
+        # Process each document
+        processing_results = {}
+        total_documents_stored = 0
+        
+        for file_path in document_files:
+            try:
+                processed_content = self.ingest_single_document(file_path, force_reprocess)
+                if processed_content:
+                    processing_results[file_path] = processed_content
+                    
+                    # Count total documents
+                    document_count = (
+                        len(processed_content.get('text', [])) + 
+                        len(processed_content.get('tables', [])) + 
+                        len(processed_content.get('visuals', []))
+                    )
+                    total_documents_stored += document_count
+                    
+            except Exception as e:
+                print(f"Error processing {file_path}: {e}")
+                processing_results[file_path] = None
+        
+        successful_files = len([r for r in processing_results.values() if r is not None])
+        
+        print(f"✓ Successfully processed {successful_files}/{len(document_files)} files")
+        print(f"✓ Total documents stored: {total_documents_stored}")
+        
+        return {
+            "processed_files": list(processing_results.keys()),
+            "successful_files": successful_files,
+            "total_files": len(document_files),
+            "total_documents": total_documents_stored,
+            "results": processing_results
+        }
+    
+    def load_from_cached_extractions(self, extraction_directory: str = "document_extractions/content") -> Tuple[int, int]:
+        """
+        Load documents from previously saved extraction files.
+        
+        Args:
+            extraction_directory: Directory containing cached extraction files
+            
+        Returns:
+            Tuple of (successful_loads, total_files)
+        """
+        print("Loading documents from cached extractions...")
+        return self.vector_store.bulk_load_from_extraction_directory(extraction_directory)
+    
+    
+    # =============================================================================
+    # QUESTION ANSWERING OPERATIONS
+    # =============================================================================
+    
+    def generate_answer(self, question: str) -> Dict[str, Any]:
+        """
+        Generate a comprehensive answer to a user question using RAG.
+        
+        Uses intelligent retrieval to find the most relevant content across
+        all content types, then generates a well-structured answer.
+        
+        Args:
+            question: User's question to answer
+            
+        Returns:
+            Dictionary containing answer, sources, and supporting materials
+        """
+        print(f"Processing question: '{question}'")
+        
+        # Retrieve contextually relevant documents using AI-driven strategy
+        relevant_documents = self.vector_store.get_contextually_relevant_documents(question)
+        
+        if not relevant_documents:
+            return {
+                "answer": "I couldn't find relevant information in the ingested documents to answer your question. Please ensure the documents containing the relevant information have been ingested into the system.",
+                "sources": [],
+                "context_used": "",
+                "supporting_images": [],
+                "supporting_tables": [],
+                "confidence": "low"
+            }
+        
+        # Format retrieved content into structured context
+        formatted_context = self._format_context_for_generation(relevant_documents)
+        
+        # Generate comprehensive answer using AI
+        answer_content = self._generate_ai_response(question, formatted_context)
+        
+        # Extract supporting materials
+        source_references = self._extract_source_references(relevant_documents)
+        supporting_images = self._extract_image_references(relevant_documents)
+        supporting_tables = self._extract_table_content(relevant_documents)
+        
+        print(f"✓ Generated answer with {len(source_references)} sources")
+        
+        return {
+            "answer": answer_content,
+            "sources": source_references,
+            "context_used": formatted_context,
+            "supporting_images": supporting_images,
+            "supporting_tables": supporting_tables,
+            "confidence": "high" if len(relevant_documents) >= 3 else "medium"
+        }
+    
+    def _format_context_for_generation(self, documents: List[Document]) -> str:
+        """
+        Format retrieved documents into well-structured context for AI generation.
+        
+        Args:
+            documents: List of relevant documents from vector search
+            
+        Returns:
+            Formatted context string organized by content type
+        """
+        context_sections = []
+        
+        # Organize documents by content type
+        text_documents = [d for d in documents if d.metadata.get("content_type") == "text"]
+        table_documents = [d for d in documents if d.metadata.get("content_type") == "table"]
+        visual_documents = [d for d in documents if d.metadata.get("content_type") == "visual"]
+        
+        # Format text content section
+        if text_documents:
+            context_sections.append("=== TEXTUAL INFORMATION ===")
+            for doc in text_documents:
+                page_ref = doc.metadata.get('page_number', 'Unknown')
+                source_ref = os.path.basename(doc.metadata.get('source_file', 'Unknown'))
+                context_sections.append(f"From {source_ref}, Page {page_ref}:")
+                context_sections.append(doc.page_content)
+                context_sections.append("")
+        
+        # Format table content section
+        if table_documents:
+            context_sections.append("=== STRUCTURED DATA & TABLES ===")
+            for doc in table_documents:
+                page_ref = doc.metadata.get('page_number', 'Unknown')
+                source_ref = os.path.basename(doc.metadata.get('source_file', 'Unknown'))
+                context_sections.append(f"Table from {source_ref}, Page {page_ref}:")
+                context_sections.append(doc.page_content)
+                context_sections.append("")
+        
+        # Format visual content section
+        if visual_documents:
+            context_sections.append("=== VISUAL ELEMENTS & CHARTS ===")
+            for doc in visual_documents:
+                page_ref = doc.metadata.get('page_number', 'Unknown')
+                source_ref = os.path.basename(doc.metadata.get('source_file', 'Unknown'))
+                context_sections.append(f"Visual description from {source_ref}, Page {page_ref}:")
+                context_sections.append(doc.page_content)
+                context_sections.append("")
+        
+        return "\n".join(context_sections)
+    
+    def _generate_ai_response(self, question: str, context: str) -> str:
+        """
+        Generate AI response using the formatted context.
+        
+        Args:
+            question: User's original question
+            context: Formatted context from retrieved documents
+            
+        Returns:
+            Generated answer content
+        """
+        generation_prompt = f"""
+        You are an expert analyst with access to multi-modal document content. Based on the provided context, answer the user's question comprehensively and accurately.
+        
+        CONTEXT FROM DOCUMENTS:
+        {context}
+        
+        USER QUESTION: {question}
+        
+        INSTRUCTIONS:
+        1. Provide a complete, well-structured answer based on the context
+        2. Use information from text, tables, and visual descriptions as appropriate
+        3. When referencing data from tables, present it clearly and cite the source
+        4. When mentioning visual elements, describe them based on the visual descriptions
+        5. Always cite which document and page your information comes from
+        6. If the context doesn't fully answer the question, clearly state what's missing
+        7. Organize your response with clear paragraphs and bullet points where helpful
+        8. Be precise and factual - don't add information not present in the context
+        
+        ANSWER:
+        """
+        
+        try:
+            ai_response = self.answer_generator.invoke([HumanMessage(content=generation_prompt)])
+            return ai_response.content.strip()
+            
+        except Exception as e:
+            print(f"Error generating AI response: {e}")
+            return "I encountered an error while generating the response. Please try asking your question again."
+    
+    def _extract_source_references(self, documents: List[Document]) -> List[Dict[str, Any]]:
+        """
+        Extract unique source references from retrieved documents.
+        
+        Args:
+            documents: List of retrieved documents
+            
+        Returns:
+            List of unique source reference dictionaries
+        """
+        source_references = []
+        seen_sources = set()
+        
+        for doc in documents:
+            source_file = doc.metadata.get("source_file", "Unknown")
+            page_number = doc.metadata.get("page_number", "Unknown")
+            content_type = doc.metadata.get("content_type", "Unknown")
+            
+            source_key = f"{source_file}_{page_number}_{content_type}"
+            
+            if source_key not in seen_sources:
+                seen_sources.add(source_key)
+                source_references.append({
+                    "source_file": os.path.basename(source_file),
+                    "page_number": page_number,
+                    "content_type": content_type,
+                    "full_path": source_file
+                })
+        
+        return source_references
+    
+    def _extract_image_references(self, documents: List[Document]) -> List[Dict[str, Any]]:
+        """
+        Extract unique image references from retrieved documents.
+        
+        Args:
+            documents: List of retrieved documents
+            
+        Returns:
+            List of unique image reference dictionaries
+        """
+        image_references = []
+        seen_images = set()
+        
+        for doc in documents:
+            image_path = doc.metadata.get("image_reference", "")
+            if image_path and image_path not in seen_images:
+                seen_images.add(image_path)
+                image_references.append({
+                    "image_path": image_path,
+                    "page_number": doc.metadata.get("page_number", "Unknown"),
+                    "source_file": os.path.basename(doc.metadata.get("source_file", "Unknown")),
+                    "content_type": doc.metadata.get("content_type", "Unknown")
+                })
+        
+        return image_references
+    
+    def _extract_table_content(self, documents: List[Document]) -> List[Dict[str, Any]]:
+        """
+        Extract table content and metadata from retrieved documents.
+        
+        Args:
+            documents: List of retrieved documents
+            
+        Returns:
+            List of table content dictionaries
+        """
+        table_content = []
+        
+        for doc in documents:
+            if doc.metadata.get("content_type") == "table":
+                table_content.append({
+                    "table_data": doc.page_content,
+                    "page_number": doc.metadata.get("page_number", "Unknown"),
+                    "source_file": os.path.basename(doc.metadata.get("source_file", "Unknown")),
+                    "image_reference": doc.metadata.get("image_reference", "")
+                })
+        
+        return table_content
         """Ingest a document with page-by-page logging and display"""
         from document_processor import DocumentProcessor
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -460,77 +826,210 @@ class MultiModalRAGPipeline:
         print("Loading documents from saved extractions...")
         self.vector_store.add_documents_from_multiple_extractions(extraction_directory)
     
-    def ingest_folder_with_caching(self, folder_path: str, force_reprocess: bool = False):
-        """Process and ingest all documents in a folder with caching support"""
-        if not os.path.exists(folder_path) or not os.path.isdir(folder_path):
-            raise ValueError(f"Invalid folder path: {folder_path}")
-        
-        # Get all supported files
-        supported_extensions = ['.pdf', '.pptx', '.eml', '.xls', '.xlsx']
-        files = [
-            os.path.join(folder_path, f) 
-            for f in os.listdir(folder_path) 
-            if any(f.lower().endswith(ext) for ext in supported_extensions)
-        ]
-        
-        if not files:
-            print("No supported files found in folder")
-            return []
-        
-        print(f"Found {len(files)} file(s) to process")
-        
-        # Process files
-        results = self.document_processor.process_multiple_documents(files, force_reprocess)
-        
-        # Add all results to vector store
-        total_docs = 0
-        for file_path, content in results.items():
-            if content:
-                self.vector_store.add_documents(content)
-                total_docs += len(content.get('text', [])) + len(content.get('tables', [])) + len(content.get('visuals', []))
-        
-        print(f"✓ Successfully ingested {len(results)} files with {total_docs} total documents")
-        return results
+        return table_content
     
-    def get_extraction_status(self):
-        """Get status of all saved extractions"""
-        extractions = self.document_processor.get_all_saved_extractions()
-        
-        print(f"\n=== EXTRACTION CACHE STATUS ===")
-        print(f"Total saved extractions: {len(extractions)}")
-        
-        if not extractions:
-            print("No saved extractions found.")
-            return
-        
-        total_text = sum(ext['content_stats']['text_items'] for ext in extractions)
-        total_tables = sum(ext['content_stats']['table_items'] for ext in extractions)
-        total_visuals = sum(ext['content_stats']['visual_items'] for ext in extractions)
-        
-        print(f"Total extracted items:")
-        print(f"  - Text items: {total_text}")
-        print(f"  - Table items: {total_tables}")  
-        print(f"  - Visual items: {total_visuals}")
-        print(f"\nRecent extractions:")
-        
-        # Sort by extraction date and show recent ones
-        sorted_extractions = sorted(
-            extractions, 
-            key=lambda x: x['extraction_date'], 
-            reverse=True
-        )[:10]
-        
-        for ext in sorted_extractions:
-            source_name = os.path.basename(ext['source_file'])
-            stats = ext['content_stats']
-            print(f"  - {source_name}: {stats['text_items']}T/{stats['table_items']}TB/{stats['visual_items']}V ({ext['extraction_date'][:10]})")
-        
-        return extractions
+    # =============================================================================
+    # SYSTEM MONITORING AND MANAGEMENT
+    # =============================================================================
     
-    def clear_old_extractions(self, keep_recent_days: int = 30):
-        """Clear old extraction files to save space"""
-        self.document_processor.clear_saved_extractions(keep_recent_days)
+    def get_system_status(self) -> Dict[str, Any]:
+        """
+        Get comprehensive status information about the RAG system.
+        
+        Returns:
+            Dictionary with extraction cache status, vector store statistics,
+            and performance configuration details
+        """
+        print("Gathering system status information...")
+        
+        # Get extraction cache status
+        cached_extractions = self.document_processor.get_all_saved_extractions()
+        
+        # Get vector store statistics
+        vector_stats = self.vector_store.get_collection_statistics()
+        
+        # Get performance configuration
+        performance_config = self.document_processor.get_performance_statistics()
+        
+        # Calculate totals
+        total_cached_text = sum(ext['content_stats']['text_items'] for ext in cached_extractions)
+        total_cached_tables = sum(ext['content_stats']['table_items'] for ext in cached_extractions)
+        total_cached_visuals = sum(ext['content_stats']['visual_items'] for ext in cached_extractions)
+        
+        system_status = {
+            "extraction_cache": {
+                "total_cached_files": len(cached_extractions),
+                "total_text_items": total_cached_text,
+                "total_table_items": total_cached_tables,
+                "total_visual_items": total_cached_visuals,
+                "recent_extractions": sorted(
+                    cached_extractions, 
+                    key=lambda x: x['extraction_date'], 
+                    reverse=True
+                )[:5]  # Show 5 most recent
+            },
+            "vector_store": vector_stats,
+            "performance_config": performance_config,
+            "system_health": {
+                "documents_in_vectors": vector_stats.get("total_documents", 0),
+                "cached_extractions": len(cached_extractions),
+                "optimization_level": self._calculate_optimization_level(performance_config)
+            }
+        }
+        
+        return system_status
     
-    def force_reprocess_document(self, file_path: str):
-        """Force reprocessing of a document (ignore cache)"""
-        return self.ingest_document(file_path, force_reprocess=True)
+    def display_system_status(self) -> None:
+        """Display a formatted system status report."""
+        status = self.get_system_status()
+        
+        print(f"\n{'='*60}")
+        print(f"🤖 MULTI-MODAL RAG SYSTEM STATUS")
+        print(f"{'='*60}")
+        
+        # Extraction Cache Status
+        cache_info = status["extraction_cache"]
+        print(f"\n📁 EXTRACTION CACHE:")
+        print(f"   • Cached files: {cache_info['total_cached_files']}")
+        print(f"   • Text items: {cache_info['total_text_items']}")
+        print(f"   • Table items: {cache_info['total_table_items']}")
+        print(f"   • Visual items: {cache_info['total_visual_items']}")
+        
+        # Vector Store Status
+        vector_info = status["vector_store"]
+        print(f"\n🗄️  VECTOR STORE:")
+        print(f"   • Total documents: {vector_info.get('total_documents', 0)}")
+        print(f"   • Text documents: {vector_info.get('collections', {}).get('text', {}).get('document_count', 0)}")
+        print(f"   • Table documents: {vector_info.get('collections', {}).get('tables', {}).get('document_count', 0)}")
+        print(f"   • Visual documents: {vector_info.get('collections', {}).get('visuals', {}).get('document_count', 0)}")
+        
+        # Performance Configuration
+        perf_info = status["performance_config"]
+        print(f"\n⚡ PERFORMANCE CONFIGURATION:")
+        opt_status = perf_info.get("optimization_status", {})
+        print(f"   • Batch Processing: {'✓' if opt_status.get('batch_processing_enabled') else '✗'}")
+        print(f"   • Image Compression: {'✓' if opt_status.get('image_compression_enabled') else '✗'}")
+        print(f"   • Smart Filtering: {'✓' if opt_status.get('smart_filtering_enabled') else '✗'}")
+        print(f"   • Parallel Processing: {'✓' if opt_status.get('parallel_processing_enabled') else '✗'}")
+        
+        # System Health
+        health_info = status["system_health"]
+        print(f"\n🏥 SYSTEM HEALTH:")
+        print(f"   • Optimization Level: {health_info['optimization_level']}")
+        print(f"   • Ready for Queries: {'✓' if health_info['documents_in_vectors'] > 0 else '✗'}")
+        
+        print(f"\n{'='*60}")
+    
+    def _calculate_optimization_level(self, performance_config: Dict[str, Any]) -> str:
+        """Calculate the optimization level based on enabled features."""
+        opt_status = performance_config.get("optimization_status", {})
+        
+        enabled_optimizations = sum([
+            opt_status.get('batch_processing_enabled', False),
+            opt_status.get('image_compression_enabled', False),
+            opt_status.get('smart_filtering_enabled', False),
+            opt_status.get('parallel_processing_enabled', False),
+            opt_status.get('duplicate_detection_enabled', False),
+            opt_status.get('extraction_caching_enabled', False)
+        ])
+        
+        if enabled_optimizations >= 5:
+            return "Excellent (Most optimizations enabled)"
+        elif enabled_optimizations >= 3:
+            return "Good (Key optimizations enabled)"
+        elif enabled_optimizations >= 1:
+            return "Basic (Some optimizations enabled)"
+        else:
+            return "Minimal (Consider enabling optimizations)"
+    
+    def get_performance_recommendations(self) -> List[str]:
+        """
+        Get actionable performance recommendations based on current configuration.
+        
+        Returns:
+            List of recommendation strings
+        """
+        performance_config = self.document_processor.get_performance_statistics()
+        opt_status = performance_config.get("optimization_status", {})
+        perf_settings = performance_config.get("performance_settings", {})
+        
+        recommendations = []
+        
+        if not opt_status.get('batch_processing_enabled', False):
+            recommendations.append("Enable batch processing for 3x faster content extraction")
+        
+        if not opt_status.get('image_compression_enabled', False):
+            recommendations.append("Enable image compression for 2x faster API uploads")
+        
+        if not opt_status.get('smart_filtering_enabled', False):
+            recommendations.append("Enable smart filtering to automatically skip low-content pages")
+        
+        if not opt_status.get('parallel_processing_enabled', False):
+            recommendations.append("Enable parallel processing for faster large document handling")
+        
+        if perf_settings.get('max_workers', 1) < 4:
+            recommendations.append("Consider increasing MAX_WORKERS to 4-6 for better parallelization")
+        
+        if perf_settings.get('image_quality', 100) > 85:
+            recommendations.append("Consider reducing IMAGE_QUALITY to 85% for faster processing with minimal quality loss")
+        
+        if not recommendations:
+            recommendations.append("Your system is well-optimized! Consider monitoring performance over time.")
+        
+        return recommendations
+    
+    def clear_extraction_cache(self, keep_recent_days: int = 30) -> None:
+        """
+        Clear old extraction cache files to free up disk space.
+        
+        Args:
+            keep_recent_days: Number of recent days to keep in cache
+        """
+        print(f"Clearing extraction cache (keeping last {keep_recent_days} days)...")
+        
+        # This would be implemented in document_processor if the method exists
+        if hasattr(self.document_processor, 'clear_saved_extractions'):
+            self.document_processor.clear_saved_extractions(keep_recent_days)
+        else:
+            print("Cache clearing not implemented in document processor")
+    
+    def force_reprocess_document(self, file_path: str) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Force reprocessing of a document, bypassing all caches.
+        
+        Args:
+            file_path: Path to document to reprocess
+            
+        Returns:
+            Processed content dictionary
+        """
+        print(f"Force reprocessing document: {os.path.basename(file_path)}")
+        return self.ingest_single_document(file_path, force_reprocess=True)
+    
+    # =============================================================================
+    # LEGACY METHOD SUPPORT (for backward compatibility)
+    # =============================================================================
+    
+    def ingest_document(self, file_path: str, force_reprocess: bool = False) -> Dict[str, List[Dict[str, Any]]]:
+        """Legacy method name - use ingest_single_document() instead."""
+        return self.ingest_single_document(file_path, force_reprocess)
+    
+    def answer_question(self, question: str) -> Dict[str, Any]:
+        """Legacy method name - use generate_answer() instead."""
+        return self.generate_answer(question)
+    
+    def ingest_from_saved_extractions(self, extraction_directory: str = "document_extractions/content") -> Tuple[int, int]:
+        """Legacy method name - use load_from_cached_extractions() instead."""
+        return self.load_from_cached_extractions(extraction_directory)
+    
+    def ingest_folder_with_caching(self, folder_path: str, force_reprocess: bool = False) -> Dict[str, Any]:
+        """Legacy method name - use ingest_folder_of_documents() instead."""
+        return self.ingest_folder_of_documents(folder_path, force_reprocess)
+    
+    def get_extraction_status(self) -> List[Dict[str, Any]]:
+        """Legacy method name - use get_system_status() instead."""
+        return self.get_system_status()["extraction_cache"]["recent_extractions"]
+    
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Legacy method name - use get_system_status() instead."""
+        return self.document_processor.get_performance_statistics()
