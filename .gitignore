@@ -20,6 +20,7 @@ ENV/
 extraction_logs/
 chroma_db/
 stored_images/
+ppt/
 *.db
 
 # IDE
